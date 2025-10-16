@@ -44,6 +44,9 @@ export class Form implements OnInit {
   private leadiDPollTimer: any = null;
   private trustedFormPollTimer: any = null;
   private trustedFormInjected = false;
+  private leadiDStarted: boolean = false;
+  isSubmitting: boolean = false;
+  hadQueryParams: boolean = false;
 
   areaCodesUS = [
     // Alabama
@@ -167,7 +170,11 @@ export class Form implements OnInit {
   ngOnInit() {
     this.fetchIPAddress();
     this.parseUrlParams();
+    // Start injecting TrustedForm and LeadiD immediately on load.
+    // LeadiD injection will delay if the initial URL had affiliate/query params (see parseUrlParams).
     this.injectTrustedFormPing();
+    this.injectTrustedForm();
+    this.injectLeadiD();
   }
 
   fetchIPAddress() {
@@ -188,6 +195,8 @@ export class Form implements OnInit {
     this.transaction_id = urlParams.get('transaction_id') || '';
     this.sub_aff_id = urlParams.get('sub_aff_id') || '';
     if (this.aff_id || this.transaction_id || this.sub_aff_id) {
+      // remember that the page had query params so we can delay LeadiD initial injection
+      this.hadQueryParams = true;
       window.history.replaceState(null, '', window.location.pathname);
     }
   }
@@ -466,6 +475,7 @@ export class Form implements OnInit {
   async submit() {
     this.errors = {};
     if (this.validateCurrentStep()) {
+      this.isSubmitting = true;
       // Read values from DOM
       this.universalLeadid = (document.getElementById('leadid_token') as HTMLInputElement)?.value || '';
       this.xxTrustedFormCertUrl = (document.querySelector('input[name="xxTrustedFormCertUrl"]') as HTMLInputElement)?.value || '';
@@ -497,69 +507,92 @@ export class Form implements OnInit {
         url: window.location.href,
         browser: navigator.userAgent
       };
-      this.http.post('https://get-gutters.com/api/ping-proxy.php', payload).subscribe({
+      this.http.post('https://getgutterss.com/api/ping-proxy.php', payload).subscribe({
         next: (response) => {
           this.showThankYou = true;
+          // stop any polling
+          if (this.leadiDPollTimer) { clearTimeout(this.leadiDPollTimer); this.leadiDPollTimer = null; }
+          if (this.trustedFormPollTimer) { clearTimeout(this.trustedFormPollTimer); this.trustedFormPollTimer = null; }
           setTimeout(() => {
             this.router.navigate(['/']);
           }, 3000);
         },
         error: (error) => {
           this.errors['general'] = 'Something went wrong, please click submit again.';
+          this.isSubmitting = false;
         }
       });
     }
   }
   private injectLeadiD(): void {
     try {
-      // Ensure the hidden input exists with the correct id and name
-      let leadIdInput = document.getElementById('leadid_token') as HTMLInputElement | null;
-      if (!leadIdInput) {
-        const input = document.createElement('input') as HTMLInputElement;
-        input.type = 'hidden';
-        input.id = 'leadid_token';
-        input.name = 'universal_leadid';
-        document.body.appendChild(input);
-        leadIdInput = input;
-      }
+      // Only start one LeadiD injection/polling cycle per page load
+      if (this.leadiDStarted) return;
+      this.leadiDStarted = true;
 
-      // Remove old script if it exists
-      const oldScript = document.getElementById('LeadiDscript_campaign');
-      if (oldScript) {
-        oldScript.parentNode?.removeChild(oldScript);
-      }
+      // Per requirements: start trying to inject after 10 seconds of first load
+      // and keep trying every 2 seconds until successful or submit
+      const initialDelay = 10000;
+      const pollInterval = 2000;
 
-      // Ensure anchor script exists
-      let anchor = document.getElementById('LeadiDscript') as HTMLScriptElement | null;
-      if (!anchor) {
-        anchor = document.createElement('script') as HTMLScriptElement;
-        anchor.id = 'LeadiDscript';
-        anchor.type = 'text/javascript';
-        document.body.appendChild(anchor);
-      }
+      const ensureHiddenInput = () => {
+        let leadIdInput = document.getElementById('leadid_token') as HTMLInputElement | null;
+        if (!leadIdInput) {
+          const input = document.createElement('input') as HTMLInputElement;
+          input.type = 'hidden';
+          input.id = 'leadid_token';
+          input.name = 'universal_leadid';
+          document.body.appendChild(input);
+          leadIdInput = input;
+        }
+      };
 
-      // Inject campaign script (only if anchor exists now)
-      if (anchor.parentNode) {
-        const s = document.createElement('script');
-        s.id = 'LeadiDscript_campaign';
-        s.type = 'text/javascript';
-        s.async = true;
-        s.src = '//create.lidstatic.com/campaign/548c86c2-3c24-2ec2-b201-274ffb0f5005.js?snippet_version=2';
-        anchor.parentNode.insertBefore(s, anchor);
-      }
+      const injectScripts = () => {
+        // Remove old campaign script if it exists
+        const oldScript = document.getElementById('LeadiDscript_campaign');
+        if (oldScript) {
+          oldScript.parentNode?.removeChild(oldScript);
+        }
 
-      // Poll for value until success
+        // Ensure anchor script exists
+        let anchor = document.getElementById('LeadiDscript') as HTMLScriptElement | null;
+        if (!anchor) {
+          anchor = document.createElement('script') as HTMLScriptElement;
+          anchor.id = 'LeadiDscript';
+          anchor.type = 'text/javascript';
+          document.body.appendChild(anchor);
+        }
+
+        // Inject campaign script (only if anchor exists now)
+        if (anchor.parentNode) {
+          const s = document.createElement('script');
+          s.id = 'LeadiDscript_campaign';
+          s.type = 'text/javascript';
+          s.async = true;
+          s.src = '//create.lidstatic.com/campaign/548c86c2-3c24-2ec2-b201-274ffb0f5005.js?snippet_version=2';
+          anchor.parentNode.insertBefore(s, anchor);
+        }
+      };
+
       const poll = () => {
         if (this.showThankYou) return;
         const el = document.getElementById('leadid_token') as HTMLInputElement | null;
         const val = el?.value || '';
         if (val) {
           this.universalLeadid = val;
+          if (this.leadiDPollTimer) { clearTimeout(this.leadiDPollTimer); this.leadiDPollTimer = null; }
         } else {
-          this.leadiDPollTimer = setTimeout(poll, 300);
+          // continue polling until found or until submit navigates away
+          this.leadiDPollTimer = setTimeout(poll, pollInterval);
         }
       };
-      setTimeout(poll, 500);
+
+      // Run initial setup after the required initial delay
+      setTimeout(() => {
+        ensureHiddenInput();
+        injectScripts();
+        poll();
+      }, initialDelay);
     } catch (e) {
       console.error('Failed to inject LeadiD:', e);
     }
@@ -580,21 +613,29 @@ export class Form implements OnInit {
 
       document.body.appendChild(tf);
 
-      // Poll the hidden field for the value
+      // Poll the hidden field for the value until found
+      const pollInterval = 300;
       const poll = () => {
         if (this.showThankYou) return;
         const el = document.getElementById('xxTrustedFormCertUrl') as HTMLInputElement | null;
         const val = el?.value || '';
         if (val) {
           this.xxTrustedFormCertUrl = val;
+          if (this.trustedFormPollTimer) { clearTimeout(this.trustedFormPollTimer); this.trustedFormPollTimer = null; }
+        } else {
+          this.trustedFormPollTimer = setTimeout(poll, pollInterval);
         }
-        this.trustedFormPollTimer = setTimeout(poll, 300);
       };
       this.trustedFormInjected = true;
       this.trustedFormPollTimer = setTimeout(poll, 500);
     } catch (e) {
       console.error('Failed to inject TrustedForm:', e);
     }
+  }
+  
+  handleEnter(event: any) {
+    // Prevent Enter from accidentally submitting the form or advancing; keep form submission explicit via buttons
+    event.preventDefault();
   }
   private injectTrustedFormPing() {
     const trustedFormPingScript = document.createElement("script");
